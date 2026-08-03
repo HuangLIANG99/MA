@@ -25,19 +25,24 @@ CYCLE_FILES_DIR = "projects/j8005-metabatt/Metabatt/VTC"
 
 SOH_RECORDS_DIR = "projects/j8005-metabatt/Metabatt/VTC/40_capacity_monitore"
 
-OUTPUT_DIR = f"output_rc_soh_{BATTERY_NUMBER_RANGE[0]}_{BATTERY_NUMBER_RANGE[1]}"
 CSV_SEPARATOR = ";"
 CSV_DECIMAL = ","
-
-
 
 AGING_KEYWORD = "Aging"
 SOH_FILE_KEYWORD = "capacity"
 
 CYCLE_FILE_EXTENSIONS = (".parquet",)
 SOH_FILE_EXTENSIONS = (".csv",)
-UNQUALIFIED_SEGMENTS = []  # 存储不符合 tau2 > 6*tau1 的片段信息
+UNQUALIFIED_SEGMENTS = []  # 存储不符合 tau2 > 5*tau1 的片段信息
 
+# ========== 排除特定工况 ==========
+# 设置要排除的工况组合，格式为 (SOC, DOD)
+# 例如排除 DOD20_SOC30 和 DOD20_SOC50
+EXCLUDED_CONDITIONS = [
+    (30, 20),  # SOC30, DOD20
+    (50, 20),  # SOC50, DOD20
+]
+# ==================================
 
 COL_TIME = "Zeit"
 COL_CURRENT = "Strom"
@@ -48,8 +53,6 @@ MIN_PAU_DURATION_S = 800
 
 PROCESS_ALL_SEGMENTS = True
 MAX_SEGMENTS_TO_PROCESS = None
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ============================================================
 # 1. MinIO / S3 / 本地读取
@@ -182,10 +185,45 @@ def get_allowed_battery_ids():
     return None
 
 
+def should_exclude_condition(filepath: str):
+    """
+    检查文件是否属于要排除的工况
+    
+    参数:
+        filepath: 文件路径
+    
+    返回:
+        bool: True表示应该排除，False表示保留
+    """
+    if not EXCLUDED_CONDITIONS:
+        return False
+    
+    filename = os.path.basename(str(filepath))
+    
+    # 提取SOC和DOD
+    soc_match = re.search(r'(\d+)SOC', filename, re.IGNORECASE)
+    dod_match = re.search(r'(\d+)DOD', filename, re.IGNORECASE)
+    
+    if not soc_match or not dod_match:
+        # 如果无法提取SOC或DOD，默认保留
+        return False
+    
+    soc = int(soc_match.group(1))
+    dod = int(dod_match.group(1))
+    
+    # 检查是否在排除列表中
+    for excluded_soc, excluded_dod in EXCLUDED_CONDITIONS:
+        if soc == excluded_soc and dod == excluded_dod:
+            return True
+    
+    return False
+
+
 def filter_files_by_allowed_batteries(files, allowed_battery_ids, file_label):
     filtered_files = []
     unknown_count = 0
     out_of_range_count = 0
+    excluded_condition_count = 0
 
     for file in files:
         battery_id = extract_battery_id(file)
@@ -198,6 +236,11 @@ def filter_files_by_allowed_batteries(files, allowed_battery_ids, file_label):
             out_of_range_count += 1
             continue
 
+        # 检查是否要排除特定工况
+        if should_exclude_condition(file):
+            excluded_condition_count += 1
+            continue
+
         filtered_files.append(file)
 
     if unknown_count:
@@ -205,6 +248,10 @@ def filter_files_by_allowed_batteries(files, allowed_battery_ids, file_label):
 
     if out_of_range_count:
         print(f"ℹ️ {file_label} 中有 {out_of_range_count} 个文件不在编号范围内，已跳过。")
+    
+    if excluded_condition_count:
+        excluded_desc = ", ".join([f"SOC{soc}_DOD{dod}" for soc, dod in EXCLUDED_CONDITIONS])
+        print(f"ℹ️ {file_label} 中排除了 {excluded_condition_count} 个 {excluded_desc} 工况的文件")
 
     return sorted(filtered_files)
 
@@ -236,6 +283,121 @@ def extract_soc_dod_from_filename(filepath: str):
     dod = dod_match.group(1) if dod_match else None
 
     return soc, dod
+
+
+def extract_test_conditions(filepath: str, return_dict=False):
+    """
+    从文件名中提取测试工况信息，如温度、SOC、DOD、倍率等
+    示例: J8005_BMWK_METABatt=METABatt_Sony_Murata_18650VTC6_003=2024-10-24_074211=jri_Aging_VTC6_Cyc_25grad_70SOC_60DOD_05C=TS015976 _ Format01=Kreis M3-034=filesize-34151246=finished.parquet
+    提取结果: 25grad_70SOC_60DOD_05C_Cyc
+    
+    参数:
+        filepath: 文件路径
+        return_dict: 如果为True，返回字典格式，否则返回字符串
+    """
+    filename = os.path.basename(str(filepath))
+    conditions = {}
+    condition_parts = []
+    
+    # 提取温度 (例如: 25grad, 25°C, 25C)
+    temp_match = re.search(r'(\d{2})grad', filename, re.IGNORECASE)
+    if temp_match:
+        temp_str = f"{temp_match.group(1)}grad"
+        conditions['temperature'] = temp_str
+        condition_parts.append(temp_str)
+    else:
+        temp_match = re.search(r'(\d{2})[°]?C', filename, re.IGNORECASE)
+        if temp_match:
+            temp_str = f"{temp_match.group(1)}C"
+            conditions['temperature'] = temp_str
+            condition_parts.append(temp_str)
+    
+    # 提取SOC (例如: 70SOC)
+    soc_match = re.search(r'(\d+)SOC', filename, re.IGNORECASE)
+    if soc_match:
+        soc_str = f"{soc_match.group(1)}SOC"
+        conditions['soc'] = soc_str
+        condition_parts.append(soc_str)
+    
+    # 提取DOD (例如: 60DOD)
+    dod_match = re.search(r'(\d+)DOD', filename, re.IGNORECASE)
+    if dod_match:
+        dod_str = f"{dod_match.group(1)}DOD"
+        conditions['dod'] = dod_str
+        condition_parts.append(dod_str)
+    
+    # # 提取倍率 (例如: 05C, 1C, 0.5C)
+    # rate_match = re.search(r'(\d+[\.]?\d*)C', filename, re.IGNORECASE)
+    # if rate_match:
+    #     rate_value = rate_match.group(1)
+    #     # 检查是否包含小数点
+    #     if '.' in rate_value:
+    #         # 将小数点替换为下划线，避免文件名中的特殊字符
+    #         rate_str = f"{rate_value.replace('.', '')}C"
+    #     else:
+    #         rate_str = f"{rate_value}C"
+    #     conditions['rate'] = rate_str
+    #     condition_parts.append(rate_str)
+    
+    # # 提取循环类型 (例如: Cyc, Pulse, Dyn)
+    # cycle_type_match = re.search(r'(Cyc|Pulse|Dyn)', filename, re.IGNORECASE)
+    # if cycle_type_match:
+    #     cycle_str = cycle_type_match.group(1)
+    #     conditions['cycle_type'] = cycle_str
+    #     condition_parts.append(cycle_str)
+    
+    if return_dict:
+        return conditions if conditions else None
+    
+    # 如果没有提取到任何工况信息，返回None
+    if not condition_parts:
+        return None
+    
+    return "_".join(condition_parts)
+
+
+def get_common_test_conditions(files):
+    """
+    从一组文件中提取共同的工况信息
+    如果所有文件都有相同的工况，返回该工况字符串
+    否则返回None
+    """
+    if not files:
+        return None
+    
+    # 提取所有文件的工况信息
+    all_conditions = []
+    for file in files:
+        cond = extract_test_conditions(file, return_dict=True)
+        if cond:
+            all_conditions.append(cond)
+    
+    if not all_conditions:
+        return None
+    
+    # 检查是否所有文件的工况都相同
+    first_cond = all_conditions[0]
+    all_same = all(cond == first_cond for cond in all_conditions)
+    
+    if all_same:
+        # 提取温度、SOC、DOD等关键信息组成文件夹名
+        parts = []
+        if 'temperature' in first_cond:
+            parts.append(first_cond['temperature'])
+        if 'soc' in first_cond:
+            parts.append(first_cond['soc'])
+        if 'dod' in first_cond:
+            parts.append(first_cond['dod'])
+        if 'rate' in first_cond:
+            parts.append(first_cond['rate'])
+        if 'cycle_type' in first_cond:
+            parts.append(first_cond['cycle_type'])
+        
+        if parts:
+            return "_".join(parts)
+    
+    # 如果工况不一致，返回通用名称
+    return "mixed_conditions"
 
 
 def normalize_column_name(name):
@@ -805,7 +967,7 @@ def identify_parameters_adaptive(t_data, V_data, segment_info=None):
     lower_bounds = [ocv_min, a_min, 0.2, a_min, 30.0]
     upper_bounds = [ocv_max, a_max, 80.0, a_max, 5000.0]
 
-    # 尝试多个初始值以满足 tau2 > 6*tau1
+    # 尝试多个初始值以满足 tau2 > 5*tau1
     tau_combinations = [
         (8.0, 150.0),
         (5.0, 100.0),
@@ -822,7 +984,8 @@ def identify_parameters_adaptive(t_data, V_data, segment_info=None):
     all_attempts = []
     
     for tau1_cand, tau2_cand in tau_combinations:
-        if tau2_cand <= 6 * tau1_cand:
+        # 修改为5倍
+        if tau2_cand <= 5 * tau1_cand:
             continue
             
         guess = [OCV_init, A1_init, tau1_cand, A2_init, tau2_cand]
@@ -844,8 +1007,8 @@ def identify_parameters_adaptive(t_data, V_data, segment_info=None):
             
             all_attempts.append((tau1_fit, tau2_fit, ratio))
             
-            # 检查条件
-            if tau2_fit > 6 * tau1_fit:
+            # 检查条件 - 修改为5倍
+            if tau2_fit > 5 * tau1_fit:
                 return popt, pcov, True
             else:
                 # 记录最佳结果（最接近满足条件的）
@@ -861,27 +1024,28 @@ def identify_parameters_adaptive(t_data, V_data, segment_info=None):
         popt, pcov, tau1_fit, tau2_fit = best_result
         ratio = tau2_fit / tau1_fit
         
-        # 记录到全局列表
+        # 记录到全局列表 - 修改提示信息为5倍
         if segment_info is not None:
             unqualified_record = {
                 'segment_info': segment_info,
                 'tau1': tau1_fit,
                 'tau2': tau2_fit,
                 'ratio': ratio,
-                'required_ratio': 6.0,
+                'required_ratio': 5.0,
                 'ocv': popt[0],
                 'a1': popt[1],
                 'a2': popt[3]
             }
             UNQUALIFIED_SEGMENTS.append(unqualified_record)
             
-            # 打印警告（可选，会实时显示）
-            print(f"⚠️ 片段不满足 tau2 > 6*tau1: {segment_info}")
-            print(f"   tau1={tau1_fit:.4f}, tau2={tau2_fit:.4f}, ratio={ratio:.4f} (需要 > 6.0)")
+            # 打印警告 - 修改提示信息为5倍
+            print(f"⚠️ 片段不满足 tau2 > 5*tau1: {segment_info}")
+            print(f"   tau1={tau1_fit:.4f}, tau2={tau2_fit:.4f}, ratio={ratio:.4f} (需要 > 5.0)")
         
         return popt, pcov, False
     
     return None, None, False
+
 
 # ============================================================
 # 6. 循环文件预处理与 PAU 片段识别
@@ -1083,32 +1247,74 @@ def process_segment(df, start_idx, end_idx, segment_info=None):
 # 8. CSV 导出
 # ============================================================
 
-def build_output_csv_path(cycle_file, battery_id, cycle_time, soc_value, dod_value):
+def build_output_csv_path(cycle_file, battery_id, cycle_time, soc_value, dod_value, base_output_dir):
+    """
+    构建输出CSV文件路径，包含工况信息
+    示例输出: VTC6_003_20241024_074211_25grad_70SOC_60DOD_05C_Cyc_abcdefgh_rc_soh.csv
+    
+    参数:
+        cycle_file: 循环文件路径
+        battery_id: 电池ID
+        cycle_time: 循环时间
+        soc_value: SOC值
+        dod_value: DOD值
+        base_output_dir: 基础输出目录
+    """
     file_hash = hashlib.md5(str(cycle_file).encode("utf-8")).hexdigest()[:8]
-
+    
+    # 提取工况信息
+    test_conditions = extract_test_conditions(cycle_file)
+    
     parts = [
         battery_id,
         cycle_time.strftime("%Y%m%d_%H%M%S"),
     ]
-
-    if soc_value:
-        parts.append(f"SOC{soc_value}")
-
-    if dod_value:
-        parts.append(f"DOD{dod_value}")
-
+    
+    # 如果有工况信息，添加到文件名中
+    if test_conditions:
+        parts.append(test_conditions)
+    else:
+        # 如果没有提取到完整的工况信息，使用SOC和DOD（如果有）
+        if soc_value:
+            parts.append(f"SOC{soc_value}")
+        if dod_value:
+            parts.append(f"DOD{dod_value}")
+    
     parts.append(file_hash)
     parts.append("rc_soh")
-
+    
     filename = safe_filename("_".join(parts)) + ".csv"
-
-    battery_output_dir = os.path.join(OUTPUT_DIR, battery_id)
+    
+     # ========== 修改：创建包含工况信息的电池子文件夹 ==========
+    # 构建电池子文件夹名，包含工况信息
+    battery_folder_name = battery_id
+    if test_conditions:
+        # 从工况信息中提取关键部分（温度、SOC、DOD、倍率、循环类型）
+        cond_parts = test_conditions.split('_')
+        # 提取温度、SOC、DOD（这些是识别工况的关键）
+        key_parts = []
+        for part in cond_parts:
+            if 'grad' in part or 'C' in part and not 'SOC' in part and not 'DOD' in part:
+                # 温度
+                key_parts.append(part)
+            elif 'SOC' in part:
+                key_parts.append(part)
+            elif 'DOD' in part:
+                key_parts.append(part)
+        # 如果提取到了关键工况信息，添加到文件夹名
+        if key_parts:
+            battery_folder_name = f"{battery_id}_{'_'.join(key_parts)}"
+        else:
+            battery_folder_name = f"{battery_id}_{test_conditions}"
+    
+    battery_output_dir = os.path.join(base_output_dir, battery_folder_name)
     os.makedirs(battery_output_dir, exist_ok=True)
-
+    # ==========================================================
+    
     return os.path.join(battery_output_dir, filename)
 
 
-def process_cycle_file_with_global_soh(cycle_entry, interval_info, soh_values_for_file):
+def process_cycle_file_with_global_soh(cycle_entry, interval_info, soh_values_for_file, base_output_dir):
     cycle_file = cycle_entry["cycle_file"]
     battery_id = interval_info["battery_id"]
     cycle_time = cycle_entry["cycle_time"]
@@ -1183,6 +1389,7 @@ def process_cycle_file_with_global_soh(cycle_entry, interval_info, soh_values_fo
         cycle_time,
         soc_value,
         dod_value,
+        base_output_dir,
     )
 
     summary_df.to_csv(
@@ -1196,11 +1403,12 @@ def process_cycle_file_with_global_soh(cycle_entry, interval_info, soh_values_fo
     print(f"✅ 已导出: {output_csv}")
     return output_csv
 
+
 # ============================================================
 # 9. checkup 区间级全局 SOH 插值处理
 # ============================================================
 
-def process_soh_interval_group(battery_id, interval_group):
+def process_soh_interval_group(battery_id, interval_group, base_output_dir):
     interval_info = interval_group["interval_info"]
     cycle_entries = interval_group["cycle_entries"]
 
@@ -1281,6 +1489,7 @@ def process_soh_interval_group(battery_id, interval_group):
                 planned_entry,
                 interval_info,
                 soh_values_for_file,
+                base_output_dir,
             )
 
             if output_csv is not None:
@@ -1311,6 +1520,11 @@ def main():
             f"🔎 电池筛选: {min(allowed_battery_ids)} -> {max(allowed_battery_ids)}, "
             f"共 {len(allowed_battery_ids)} 块"
         )
+    
+    # 显示排除的工况信息
+    if EXCLUDED_CONDITIONS:
+        excluded_desc = ", ".join([f"SOC{soc}_DOD{dod}" for soc, dod in EXCLUDED_CONDITIONS])
+        print(f"🚫 排除工况: {excluded_desc}")
 
     cycle_files_all = list_files_from_folder(
         CYCLE_FILES_DIR,
@@ -1333,7 +1547,7 @@ def main():
         return
 
     print(f"✅ 找到 Aging 循环文件数量: {len(cycle_files_all)}")
-    print(f"✅ 电池编号筛选后循环文件数量: {len(cycle_files)}")
+    print(f"✅ 筛选后循环文件数量: {len(cycle_files)}")
 
     cycle_files_by_battery = group_files_by_battery(cycle_files)
 
@@ -1346,6 +1560,46 @@ def main():
         battery_ids_to_process = sorted(allowed_battery_ids)
     else:
         battery_ids_to_process = sorted(cycle_files_by_battery.keys())
+
+    # ========== 确定输出文件夹名称 ==========
+    # 收集所有将要处理的循环文件
+    all_files_to_process = []
+    for battery_id in battery_ids_to_process:
+        if battery_id in cycle_files_by_battery:
+            all_files_to_process.extend(cycle_files_by_battery[battery_id])
+    
+    # 提取共同的工况信息
+    common_conditions = get_common_test_conditions(all_files_to_process)
+    
+    # 添加排除工况信息到文件夹名
+    exclusion_suffix = ""
+    if EXCLUDED_CONDITIONS:
+        excluded_parts = []
+        for soc, dod in sorted(EXCLUDED_CONDITIONS):
+            excluded_parts.append(f"noSOC{soc}DOD{dod}")
+        exclusion_suffix = "_" + "_".join(excluded_parts)
+    
+    if common_conditions:
+        # 构建包含工况信息的输出文件夹名
+        if BATTERY_NUMBER_RANGE:
+            output_dir_name = f"output_rc_soh_{BATTERY_NUMBER_RANGE[0]}_{BATTERY_NUMBER_RANGE[1]}_{common_conditions}{exclusion_suffix}"
+        else:
+            output_dir_name = f"output_rc_soh_{common_conditions}{exclusion_suffix}"
+    else:
+        # 如果没有工况信息，使用默认名称
+        if BATTERY_NUMBER_RANGE:
+            output_dir_name = f"output_rc_soh_{BATTERY_NUMBER_RANGE[0]}_{BATTERY_NUMBER_RANGE[1]}{exclusion_suffix}"
+        else:
+            output_dir_name = f"output_rc_soh{exclusion_suffix}"
+    
+    BASE_OUTPUT_DIR = output_dir_name
+    os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
+    print(f"📁 输出文件夹: {BASE_OUTPUT_DIR}")
+    print(f"📋 工况信息: {common_conditions if common_conditions else '混合工况（未提取到统一工况）'}")
+    if EXCLUDED_CONDITIONS:
+        excluded_desc = ", ".join([f"SOC{soc}_DOD{dod}" for soc, dod in EXCLUDED_CONDITIONS])
+        print(f"🚫 已排除工况: {excluded_desc}")
+    # ===========================================
 
     success_count = 0
     skipped_cycle_count = 0
@@ -1386,6 +1640,7 @@ def main():
             interval_success, interval_skipped = process_soh_interval_group(
                 battery_id,
                 interval_groups[interval_key],
+                BASE_OUTPUT_DIR,
             )
 
             success_count += interval_success
@@ -1398,11 +1653,14 @@ def main():
     print(f"ℹ️ 未匹配到 checkup 区间的循环文件数: {skipped_interval_match_count}")
     print(f"ℹ️ 没有循环文件的电池数: {skipped_battery_no_cycle_count}")
     print(f"ℹ️ 没有 SOH/checkup 文件的电池数: {skipped_battery_no_soh_count}")
-    print(f"📁 输出文件夹: {OUTPUT_DIR}")
+    if EXCLUDED_CONDITIONS:
+        excluded_desc = ", ".join([f"SOC{soc}_DOD{dod}" for soc, dod in EXCLUDED_CONDITIONS])
+        print(f"🚫 已排除 {excluded_desc} 工况的文件")
+    print(f"📁 输出文件夹: {BASE_OUTPUT_DIR}")
     
     # 报告不符合条件的片段
     print("\n" + "-" * 100)
-    print("🔍 不符合 tau2 > 6*tau1 条件的片段统计:")
+    print("🔍 不符合 tau2 > 5*tau1 条件的片段统计:")
     print(f"总不符合条件的片段数: {len(UNQUALIFIED_SEGMENTS)}")
     
     if UNQUALIFIED_SEGMENTS:
@@ -1418,7 +1676,7 @@ def main():
         
         # 创建不符合条件的片段汇总CSV
         unqualified_df = pd.DataFrame(UNQUALIFIED_SEGMENTS)
-        unqualified_csv_path = os.path.join(OUTPUT_DIR, "unqualified_segments_summary.csv")
+        unqualified_csv_path = os.path.join(BASE_OUTPUT_DIR, "unqualified_segments_summary.csv")
         unqualified_df.to_csv(
             unqualified_csv_path,
             index=False,
@@ -1438,7 +1696,7 @@ def main():
         if len(UNQUALIFIED_SEGMENTS) > 10:
             print(f"  ... 还有 {len(UNQUALIFIED_SEGMENTS) - 10} 个片段，详见CSV文件")
     else:
-        print("🎉 所有片段都满足 tau2 > 6*tau1 条件！")
+        print("🎉 所有片段都满足 tau2 > 5*tau1 条件！")
     
     print("=" * 100)
 
